@@ -1,12 +1,3 @@
-# ---- Core ----
-pyrogram>=2.0.106
-TgCrypto>=1.2.5
-python-decouple>=3.8
-
-# ---- Database ----
 SQLAlchemy>=2.0.30
-aiosqlite>=0.20.0        # for sqlite+aiosqlite://
-asyncpg>=0.29.0          # for postgresql+asyncpg:// (optional, remove if using SQLite only)
-
-# ---- Scheduler ----
-APScheduler>=3.10.4
+greenlet>=3.0.0
+aiosqlite>=0.20.0
