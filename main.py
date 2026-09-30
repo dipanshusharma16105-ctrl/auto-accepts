@@ -11,14 +11,14 @@ Run:
     pip install -r requirements.txt && python bot.py
 
 Highlights
-  * SIMPLE automation wizard: "What message should trigger?" -> "What should I reply?"
-    Default match is EXACT. No hidden "any" surprise.
-  * Fast path: in-memory rule/button/settings cache; execution counters bumped with
-    one batched UPDATE per message; no full-cache invalidation on incoming messages.
+  * SIMPLE automation wizard: match type chosen first, then trigger, then reply.
+    Default match type: EXACT.
+  * Fast path: in-memory rule/button/settings cache; single NFKC + casefold
+    normalization per incoming message; per-rule cached normalized trigger.
   * Non-blocking user relay (spawn) so automations reply instantly.
   * Advanced Settings submenu (match type, scope, priority, cooldown, media, buttons).
   * Full edit flows: one-step edits that save & return.
-  * Rule Duplicate + per-rule logs + rule-level Test.
+  * Rule Duplicate + per-rule logs + rule-level Test (uses the SAME matcher).
   * Channels tab: Add / Remove / Settings / Refresh.
   * Legacy auto-reply fully migrated & suppressed once any automation exists.
   * 💾 Backup & Restore inside System Tools:
@@ -40,6 +40,7 @@ import shutil
 import sys
 import time
 import traceback
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
@@ -146,6 +147,66 @@ def today_start() -> datetime:
 
 def esc(v) -> str:
     return _html.escape(str(v if v is not None else ""), quote=False)
+
+
+# ---------------------------------------------------------------------------
+# MATCHING NORMALIZATION (hot path)
+# ---------------------------------------------------------------------------
+
+_WS_COLLAPSE_RE = re.compile(r"\s+")
+
+
+def normalize_match_text(text: Any, case_insensitive: bool = True) -> str:
+    """Fast, crash-safe normalization used by the automation matcher.
+
+    - NFKC unicode normalization (folds fullwidth, ligatures, etc.)
+    - Collapse runs of whitespace to a single space
+    - Trim leading/trailing whitespace
+    - casefold() when case-insensitive (better than lower() for Unicode)
+    - Never raises.
+    """
+    if text is None:
+        return ""
+    try:
+        s = text if isinstance(text, str) else str(text)
+    except Exception:
+        return ""
+    if not s:
+        return ""
+    try:
+        s = unicodedata.normalize("NFKC", s)
+    except Exception:
+        pass
+    if "  " in s or "\n" in s or "\t" in s or "\r" in s:
+        s = _WS_COLLAPSE_RE.sub(" ", s)
+    s = s.strip()
+    if not case_insensitive:
+        return s
+    try:
+        return s.casefold()
+    except Exception:
+        return s.lower()
+
+
+def _get_normalized_trigger(rule: "AutomationRule") -> str:
+    """Return the normalized trigger cached on the (already in-memory) rule.
+
+    The enabled-rules cache holds ORM objects between messages, so caching the
+    normalized value on the instance avoids re-normalizing the same trigger on
+    every incoming message. Cache is naturally refreshed when rules reload.
+    """
+    raw = rule.trigger_value or ""
+    ci = bool(rule.case_insensitive)
+    key = (raw, ci)
+    cached = getattr(rule, "_cm_trigger_cache", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    norm = normalize_match_text(raw, ci)
+    try:
+        rule._cm_trigger_cache = (key, norm)
+    except Exception:
+        pass
+    return norm
 
 
 # ===========================================================================
@@ -2122,36 +2183,44 @@ def _split_keywords(value: str) -> list:
     return [p.strip() for p in parts if p.strip()]
 
 
+# Allowed match types (validated at save-time and callback-time).
+ALLOWED_MATCH_TYPES = frozenset({
+    "exact", "contains", "starts", "ends", "regex", "any_kw", "all_kw", "any",
+})
+
+
 def _match_rule(rule: AutomationRule, text: str) -> bool:
+    """Central matching function used by BOTH live automations and rule tests.
+
+    Never raises. Uses normalize_match_text() with NFKC + casefold + whitespace
+    collapse so Unicode and formatting variations behave consistently.
+    """
     if rule.trigger_type == "message":
-        if rule.match_type == "any":
+        mt = rule.match_type or "exact"
+        if mt == "any":
             return True
         raw = rule.trigger_value or ""
-        needle = text or ""
-        if not raw and rule.match_type != "any":
+        if not raw:
             return False
-        if rule.case_insensitive:
-            raw_cmp = raw.lower()
-            needle_cmp = needle.lower()
-        else:
-            raw_cmp = raw
-            needle_cmp = needle
-        mt = rule.match_type
+        ci = bool(rule.case_insensitive)
+        needle = normalize_match_text(text, ci)
+        hay = _get_normalized_trigger(rule)
         try:
             if mt == "exact":
-                return needle_cmp == raw_cmp
+                return needle == hay
             if mt == "contains":
-                return bool(raw_cmp) and raw_cmp in needle_cmp
+                return bool(hay) and hay in needle
             if mt == "starts":
-                return bool(raw_cmp) and needle_cmp.startswith(raw_cmp)
+                return bool(hay) and needle.startswith(hay)
             if mt == "ends":
-                return bool(raw_cmp) and needle_cmp.endswith(raw_cmp)
+                return bool(hay) and needle.endswith(hay)
             if mt == "regex":
-                flags = re.IGNORECASE if rule.case_insensitive else 0
-                return bool(re.search(raw, needle, flags))
+                flags = re.IGNORECASE if ci else 0
+                return bool(re.search(raw, str(text or ""), flags))
             if mt == "any_kw":
                 for kw in _split_keywords(rule.trigger_value):
-                    if (kw.lower() if rule.case_insensitive else kw) in needle_cmp:
+                    nk = normalize_match_text(kw, ci)
+                    if nk and nk in needle:
                         return True
                 return False
             if mt == "all_kw":
@@ -2159,17 +2228,30 @@ def _match_rule(rule: AutomationRule, text: str) -> bool:
                 if not kws:
                     return False
                 for kw in kws:
-                    if (kw.lower() if rule.case_insensitive else kw) not in needle_cmp:
+                    nk = normalize_match_text(kw, ci)
+                    if not nk or nk not in needle:
                         return False
                 return True
         except re.error:
             return False
+        except Exception as exc:
+            logger.warning("match error rule_id=%s match_type=%s: %s",
+                           getattr(rule, "id", "?"), mt, exc)
+            return False
     elif rule.trigger_type == "command":
-        cmd = (rule.trigger_value or "").lstrip("/").lower()
+        cmd = (rule.trigger_value or "").lstrip("/").strip()
         if not cmd:
             return False
+        try:
+            cmd_n = cmd.casefold()
+        except Exception:
+            cmd_n = cmd.lower()
         first = (text or "").split()[0] if text else ""
-        return first.lower().lstrip("/") == cmd
+        try:
+            first_n = first.casefold().lstrip("/")
+        except Exception:
+            first_n = first.lower().lstrip("/")
+        return first_n == cmd_n
     return False
 
 
@@ -2441,14 +2523,26 @@ TRIGGER_LABELS = {
 }
 
 MATCH_LABELS = {
-    "exact": "🎯 Exact match",
-    "contains": "🔎 Contains",
-    "starts": "▶️ Starts with",
-    "ends": "⏹ Ends with",
+    "exact": "🎯 Exact Match",
+    "contains": "🔎 Contains / Keyword",
+    "starts": "▶️ Starts With",
+    "ends": "⏹ Ends With",
     "regex": "🧬 Regex",
-    "any_kw": "🧩 Any keyword",
-    "all_kw": "🧩 All keywords",
-    "any": "🌀 Any message",
+    "any_kw": "🧩 Any Keyword",
+    "all_kw": "🧩 All Keywords",
+    "any": "🌀 Any Message",
+}
+
+# Compact badges used in list/preview/rule views.
+_MATCH_BADGE = {
+    "exact": "🎯",
+    "contains": "🔎",
+    "starts": "▶️",
+    "ends": "⏹",
+    "regex": "🧬",
+    "any_kw": "🧩",
+    "all_kw": "🧩",
+    "any": "🌀",
 }
 
 RESPONSE_LABELS = {
@@ -2522,9 +2616,10 @@ async def build_rule_list(page: int = 1, active_only: bool = False):
     for r in rules:
         dot = "🟢" if r.enabled else "🔴"
         trig = _short_trigger_preview(r)
+        badge = _MATCH_BADGE.get(r.match_type, "•")
         resp = short_preview(r.response_text, 40) if r.response_text else f"[{r.response_type}]"
         lines.append(f"{dot} <b>#{r.id} {esc(r.name)}</b>\n"
-                     f"   💬 <code>{esc(trig)}</code> → 📤 <i>{resp}</i>\n"
+                     f"   {badge} <code>{esc(trig)}</code> → 📤 <i>{resp}</i>\n"
                      f"   {_scope_summary(r)} · P{r.priority} · runs: {r.execution_count} · err: {r.error_count}")
         kb.append([
             InlineKeyboardButton(f"⚙️ #{r.id}", callback_data=f"auto:view:{r.id}"),
@@ -2553,7 +2648,7 @@ async def build_rule_view(rule_id: int):
     if r.trigger_type == "message":
         trig = _short_trigger_preview(r)
         trigger_line = (f"<b>Trigger:</b> 💬 message\n"
-                        f"<b>Match:</b> {MATCH_LABELS.get(r.match_type, r.match_type)}\n"
+                        f"<b>Match:</b> {esc(MATCH_LABELS.get(r.match_type, r.match_type))}\n"
                         f"<b>Pattern:</b> <code>{esc(trig or '(any)')}</code>\n")
     elif r.trigger_type == "command":
         trigger_line = (f"<b>Trigger:</b> 🔧 command <code>/{esc(r.trigger_value or '')}</code>\n")
@@ -2575,7 +2670,8 @@ async def build_rule_view(rule_id: int):
          InlineKeyboardButton("✏️ Edit Trigger", callback_data=f"auto:edit_pattern:{r.id}")],
         [InlineKeyboardButton("✏️ Edit Reply", callback_data=f"auto:edit_response:{r.id}"),
          InlineKeyboardButton("🖼 Set Media", callback_data=f"auto:edit_media:{r.id}")],
-        [InlineKeyboardButton("⚙️ Advanced Settings", callback_data=f"auto:advanced:{r.id}")],
+        [InlineKeyboardButton("🔄 Match Type", callback_data=f"auto:edit_match:{r.id}"),
+         InlineKeyboardButton("⚙️ Advanced Settings", callback_data=f"auto:advanced:{r.id}")],
         [InlineKeyboardButton("👁 Preview", callback_data=f"auto:preview:{r.id}"),
          InlineKeyboardButton("🧪 Test", callback_data=f"auto:test_rule:{r.id}")],
         [InlineKeyboardButton("📋 Logs", callback_data=f"auto:logs_rule:{r.id}:1"),
@@ -2594,7 +2690,7 @@ async def build_rule_advanced(rule_id: int):
         if r is None:
             return "❔ Rule not found.", kb_back("auto:main")
     txt = (f"⚙️ <b>Advanced Settings — Rule #{r.id}</b>\n\n"
-           f"<b>Match type:</b> {MATCH_LABELS.get(r.match_type, r.match_type)}\n"
+           f"<b>Match type:</b> {esc(MATCH_LABELS.get(r.match_type, r.match_type))}\n"
            f"<b>Scope:</b> {_scope_summary(r)}\n"
            f"<b>Priority:</b> {r.priority}\n"
            f"<b>Cooldown:</b> {r.cooldown_seconds}s\n"
@@ -2668,7 +2764,7 @@ async def build_automation_stats():
 
 
 # ===========================================================================
-# SIMPLE AUTOMATION WIZARD
+# SIMPLE AUTOMATION WIZARD  (match-type first, then trigger, then reply)
 # ===========================================================================
 
 def _draft(f: Flow) -> dict:
@@ -2678,23 +2774,37 @@ def _draft(f: Flow) -> dict:
     return d
 
 
+def kb_wizard_match_type(current: str = "") -> InlineKeyboardMarkup:
+    def mark(mode: str, label: str) -> str:
+        return f"✅ {label}" if current == mode else label
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(mark("exact", "🎯 Exact Match"),
+                              callback_data="auto:draft_pick:exact")],
+        [InlineKeyboardButton(mark("contains", "🔎 Contains / Keyword"),
+                              callback_data="auto:draft_pick:contains")],
+        [InlineKeyboardButton(mark("any", "🌀 Any Message"),
+                              callback_data="auto:draft_pick:any")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="auto:cancel")],
+    ])
+
+
 async def _wizard_start(cq: CallbackQuery, admin_id: int):
     reset_flow(admin_id)
     f = flow(admin_id)
-    f.state = St.AUTO_TRIGGER
     f.origin_section = "auto:create"
-    _draft(f).clear()
+    d = _draft(f)
+    d.clear()
+    d["trigger_type"] = "message"
+    d["match_type"] = "exact"
     await safe_edit(
         cq.message,
-        "➕ <b>New Automation — Step 1/2</b>\n\n"
-        "💬 <b>What message should trigger the reply?</b>\n\n"
-        "<i>Example:</i> <code>hello</code>\n\n"
-        "The bot will reply when a user sends exactly this text "
-        "(you can switch to contains/keywords/regex in Advanced Settings after saving).",
-        InlineKeyboardMarkup([
-            [InlineKeyboardButton("🌀 Any Message", callback_data="auto:trig:any")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="auto:cancel")],
-        ]))
+        "➕ <b>New Automation — Step 1/3</b>\n\n"
+        "💬 <b>How should the trigger match?</b>\n\n"
+        "🎯 <b>Exact Match</b> — the whole message must match (whitespace/case ignored).\n"
+        "🔎 <b>Contains / Keyword</b> — fires when the keyword appears anywhere.\n"
+        "🌀 <b>Any Message</b> — fire on every private message.\n\n"
+        "<i>You can switch modes later in Advanced Settings.</i>",
+        kb_wizard_match_type(d["match_type"]))
 
 
 async def _wizard_show_preview(chat_id: int, admin_id: int, edit_msg: Optional[Message] = None):
@@ -2711,15 +2821,18 @@ async def _wizard_show_preview(chat_id: int, admin_id: int, edit_msg: Optional[M
     else:
         resp_display = f"<code>{esc(short_preview(resp_text, 200))}</code>"
 
-    txt = (f"✅ <b>Preview</b>\n\n"
+    match_label = MATCH_LABELS.get(match, match)
+    icon = _MATCH_BADGE.get(match, "•")
+    txt = (f"✅ <b>Automation Preview</b>\n\n"
            f"💬 <b>Trigger:</b> {trig_display}\n"
-           f"🎯 <b>Match mode:</b> {MATCH_LABELS.get(match, match)}\n\n"
+           f"{icon} <b>Match Mode:</b> {esc(match_label)}\n\n"
            f"📤 <b>Bot will reply:</b>\n{resp_display}\n\n"
            f"Click <b>Save</b> to activate, or use <b>Advanced</b> to add media, "
            f"buttons, cooldown, priority or channel scope.")
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("💾 Save Automation", callback_data="auto:save_draft")],
         [InlineKeyboardButton("⚙️ Advanced Settings", callback_data="auto:adv_draft")],
+        [InlineKeyboardButton("🔄 Change Match Type", callback_data="auto:create")],
         [InlineKeyboardButton("❌ Cancel", callback_data="auto:cancel")],
     ])
     if edit_msg is not None:
@@ -2739,12 +2852,12 @@ async def handle_auto_wizard_text(admin_id: int, chat_id: int, message: Message)
                                      parse_mode=HTML)
             return True
         d = _draft(f)
+        d.setdefault("trigger_type", "message")
+        d.setdefault("match_type", "exact")
         d["trigger_value"] = txt[:2000]
-        d["match_type"] = "exact"
-        d["trigger_type"] = "message"
         f.state = St.AUTO_RESPONSE
         await message.reply_text(
-            "➕ <b>Step 2/2</b>\n\n"
+            "➕ <b>New Automation — Step 3/3</b>\n\n"
             "📤 <b>Now send what you want the bot to reply.</b>\n\n"
             "You can also send a <b>photo / video / document / audio / voice / GIF</b> "
             "with an optional caption.",
@@ -2768,15 +2881,12 @@ async def handle_auto_wizard_text(admin_id: int, chat_id: int, message: Message)
         rule_id = f.data.get("edit_rule_id")
         draft_mode = f.data.get("draft_mode")
         if draft_mode and not rule_id:
-            # Editing the draft's name
             d = _draft(f)
             d["name"] = txt[:200]
-            reset_flow(admin_id)
-            # Restore the draft reference — we just cleared flow but kept the draft in state? No.
-            # Instead, keep it simple: show the preview.
-            # NOTE: Because we cleared, we re-show the preview from the last known state.
-            # In practice name-edit-in-draft is rare; fall back to preview.
-            await message.reply_text("✅ Name saved. Reopen Create Automation to review.")
+            f.state = St.NONE
+            f.data.pop("draft_mode", None)
+            # Re-render the preview (draft is retained on the Flow.data dict)
+            await _wizard_show_preview(chat_id, admin_id)
             return True
         reset_flow(admin_id)
         if not rule_id or not txt:
@@ -2922,9 +3032,16 @@ async def handle_auto_wizard_media(admin_id: int, chat_id: int, message: Message
 async def _save_draft_rule(d: dict) -> Optional[int]:
     try:
         match_type = d.get("match_type", "exact")
+        if match_type not in ALLOWED_MATCH_TYPES:
+            logger.warning("save_draft_rule: rejected invalid match_type=%r", match_type)
+            return None
         trigger_value = d.get("trigger_value", "")
         if match_type == "any":
             trigger_value = ""
+        elif not (trigger_value or "").strip():
+            logger.warning("save_draft_rule: rejected empty trigger_value for match_type=%s",
+                           match_type)
+            return None
         name = d.get("name") or (trigger_value[:50] if trigger_value else "Any message")
         async with SessionLocal() as s:
             rule = AutomationRule(
@@ -4030,7 +4147,7 @@ async def handle_admin_message(client: Client, message: Message, uid: int):
 
 
 # ===========================================================================
-# AUTOMATION — rule test
+# AUTOMATION — rule test  (uses the same matcher as live execution)
 # ===========================================================================
 
 async def _run_rule_test(chat_id: int, rule_id: int, message: Message):
@@ -4046,14 +4163,14 @@ async def _run_rule_test(chat_id: int, rule_id: int, message: Message):
     result = await _execute_rule(
         rule, user_id=u.id, first_name=u.first_name or "", last_name=u.last_name or "",
         username=u.username or "", channel_id=None, channel_name="", test_only=True)
-    ok = "✅" if matched else "❌"
+    match_label = MATCH_LABELS.get(rule.match_type, rule.match_type)
+    trig_disp = "(any)" if rule.match_type == "any" else (rule.trigger_value or "(empty)")
+    verdict = "✅ MATCH" if matched else "❌ NO MATCH"
     txt = (f"🧪 <b>Rule Test — #{rule.id} {esc(rule.name)}</b>\n\n"
-           f"Input: <i>{esc(text[:200])}</i>\n"
-           f"Trigger matched: {ok}\n"
-           f"Match mode: {MATCH_LABELS.get(rule.match_type, rule.match_type)}\n"
-           f"Scope: {_scope_summary(rule)}\n"
-           f"Cooldown: {'configured ' + str(rule.cooldown_seconds) + 's' if rule.cooldown_seconds else 'none'}\n"
-           f"Priority: {rule.priority}\n\n"
+           f"💬 <b>Trigger:</b> <code>{esc(trig_disp)}</code>\n"
+           f"🎯 <b>Match Mode:</b> {esc(match_label)}\n"
+           f"📨 <b>Test input:</b> <i>{esc(text[:200])}</i>\n\n"
+           f"<b>Result:</b> {verdict}\n\n"
            f"<b>Response preview:</b>\n<blockquote>{esc(result.get('preview','') or '(empty)')}</blockquote>")
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 Send Test To Me", callback_data=f"auto:test_send:{rule.id}")],
@@ -4081,7 +4198,8 @@ async def _run_global_test(chat_id: int, message: Message):
     lines = [f"🧪 <b>Global Test</b> — input: <i>{esc(text[:120])}</i>\n",
              f"Matched <b>{len(matched_any)}</b> rule(s):"]
     for r in matched_any:
-        lines.append(f"  • #{r.id} {esc(r.name)} → {short_preview(r.response_text, 60)}")
+        badge = _MATCH_BADGE.get(r.match_type, "•")
+        lines.append(f"  • {badge} #{r.id} {esc(r.name)} → {short_preview(r.response_text, 60)}")
     await bot.send_message(chat_id, "\n".join(lines), reply_markup=kb_back("auto:main"),
                            parse_mode=HTML)
 
@@ -5022,6 +5140,60 @@ async def on_callback(client: Client, cq: CallbackQuery):
             reset_flow(admin_id)
             await safe_edit(cq.message, await build_automation_main_text(), kb_automation_main())
 
+        # -------- Match-Type picker (primary step for new automations) --------
+        elif data.startswith("auto:draft_pick:"):
+            mode = p[2]
+            if mode not in ("exact", "contains", "any"):
+                await ack("Unknown mode.", True)
+                return
+            f = flow(admin_id)
+            d = _draft(f)
+            d["trigger_type"] = "message"
+            d["match_type"] = mode
+            if mode == "any":
+                d["trigger_value"] = ""
+                f.state = St.AUTO_RESPONSE
+                await ack()
+                await safe_edit(
+                    cq.message,
+                    "➕ <b>New Automation — Step 2/2</b>\n\n"
+                    "🌀 <b>Any Message</b> — the automation will reply to every incoming "
+                    "private message.\n\n"
+                    "📤 <b>Now send what you want the bot to reply.</b>\n\n"
+                    "You can also send a photo / video / document / audio / voice / GIF "
+                    "with an optional caption.",
+                    InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Change Match Type",
+                                              callback_data="auto:create")],
+                        [InlineKeyboardButton("❌ Cancel", callback_data="auto:cancel")],
+                    ]))
+            else:
+                f.state = St.AUTO_TRIGGER
+                await ack()
+                if mode == "exact":
+                    body = (
+                        "➕ <b>New Automation — Step 2/3</b>\n\n"
+                        "🎯 <b>Exact Match</b>\n\n"
+                        "Send the complete message that should trigger the automation.\n\n"
+                        "Example: <code>hello</code>\n\n"
+                        "<i>The automation fires only when the whole message matches "
+                        "(case and extra whitespace are ignored).</i>")
+                else:
+                    body = (
+                        "➕ <b>New Automation — Step 2/3</b>\n\n"
+                        "🔎 <b>Contains / Keyword</b>\n\n"
+                        "Send the keyword or phrase that should trigger the automation.\n\n"
+                        "Example: <code>hello</code>\n\n"
+                        "It will trigger for:\n"
+                        "• hello\n• hello bro\n• Hi hello, how are you?\n"
+                        "• I am saying hello to you")
+                await safe_edit(cq.message, body,
+                                InlineKeyboardMarkup([
+                                    [InlineKeyboardButton("🔄 Change Match Type",
+                                                          callback_data="auto:create")],
+                                    [InlineKeyboardButton("❌ Cancel", callback_data="auto:cancel")],
+                                ]))
+
         elif p[0] == "auto" and p[1] == "list":
             page = int(p[2]) if len(p) > 2 else 1
             active_only = len(p) > 3 and p[3] == "on"
@@ -5327,21 +5499,55 @@ async def on_callback(client: Client, cq: CallbackQuery):
         elif data.startswith("auto:edit_match:"):
             rule_id = int(p[2])
             await ack()
+            async with SessionLocal() as s:
+                r = (await s.execute(select(AutomationRule).where(
+                    AutomationRule.id == rule_id))).scalar_one_or_none()
+            current = (r.match_type if r else "exact") or "exact"
+
+            def _lbl(mt: str, label: str) -> str:
+                return f"✅ {label}" if current == mt else label
+
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton(label, callback_data=f"auto:set_match:{rule_id}:{mt}")]
-                for mt, label in MATCH_LABELS.items()
-            ] + [[InlineKeyboardButton("« Back", callback_data=f"auto:view:{rule_id}")]])
-            await safe_edit(cq.message, "Choose match type:", kb)
+                [InlineKeyboardButton(_lbl("exact", "🎯 Exact Match"),
+                                      callback_data=f"auto:set_match:{rule_id}:exact")],
+                [InlineKeyboardButton(_lbl("contains", "🔎 Contains / Keyword"),
+                                      callback_data=f"auto:set_match:{rule_id}:contains")],
+                [InlineKeyboardButton(_lbl("any", "🌀 Any Message"),
+                                      callback_data=f"auto:set_match:{rule_id}:any")],
+                [InlineKeyboardButton(_lbl("starts", "▶️ Starts With"),
+                                      callback_data=f"auto:set_match:{rule_id}:starts"),
+                 InlineKeyboardButton(_lbl("ends", "⏹ Ends With"),
+                                      callback_data=f"auto:set_match:{rule_id}:ends")],
+                [InlineKeyboardButton(_lbl("regex", "🧬 Regex"),
+                                      callback_data=f"auto:set_match:{rule_id}:regex")],
+                [InlineKeyboardButton(_lbl("any_kw", "🧩 Any Keyword"),
+                                      callback_data=f"auto:set_match:{rule_id}:any_kw"),
+                 InlineKeyboardButton(_lbl("all_kw", "🧩 All Keywords"),
+                                      callback_data=f"auto:set_match:{rule_id}:all_kw")],
+                [InlineKeyboardButton("« Back", callback_data=f"auto:view:{rule_id}")],
+            ])
+            await safe_edit(cq.message,
+                            "🔄 <b>Choose match type</b>\n\n"
+                            "<i>Exact and Contains are the primary modes. "
+                            "Advanced modes remain available below.</i>",
+                            kb)
 
         elif data.startswith("auto:set_match:"):
             rule_id, mt = int(p[2]), p[3]
+            if mt not in ALLOWED_MATCH_TYPES:
+                await ack("Unknown match type.", True)
+                return
             async with SessionLocal() as s:
                 r = (await s.execute(select(AutomationRule).where(
                     AutomationRule.id == rule_id))).scalar_one_or_none()
                 if r:
+                    if mt != "any" and not (r.trigger_value or "").strip():
+                        await ack("Please set a trigger value first.", True)
+                        return
                     r.match_type = mt
                     if mt == "any":
                         r.trigger_value = ""
+                    r.updated_at = now_utc()
                     await s.commit()
             invalidate_automation_cache()
             await ack("Match type updated.")
@@ -5391,6 +5597,7 @@ async def on_callback(client: Client, cq: CallbackQuery):
 
         # ---------- SIMPLE WIZARD step responses ----------
         elif data == "auto:trig:any":
+            # Backwards-compatible alias for the "Any Message" option.
             await ack()
             f = flow(admin_id)
             d = _draft(f)
@@ -5406,16 +5613,21 @@ async def on_callback(client: Client, cq: CallbackQuery):
                 InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="auto:cancel")]]))
 
         elif data == "auto:save_draft":
-            await ack("Saving…")
             f = flow(admin_id)
             d = _draft(f)
-            if not d.get("trigger_value") and d.get("match_type") != "any":
-                await safe_edit(cq.message, "❌ Missing trigger value. Cancelled.",
-                                kb_back("auto:main"))
-                reset_flow(admin_id)
+            mt = d.get("match_type", "exact")
+            if mt not in ALLOWED_MATCH_TYPES:
+                await ack("Invalid match type.", True)
                 return
+            trig = (d.get("trigger_value") or "").strip()
+            if mt != "any" and not trig:
+                await ack("Please enter a keyword or phrase.", True)
+                await safe_edit(cq.message,
+                                "❌ Please enter a keyword or phrase.",
+                                kb_back("auto:adv_draft"))
+                return
+            await ack("Saving…")
             d.setdefault("trigger_type", "message")
-            d.setdefault("match_type", "exact")
             d.setdefault("response_type", "text")
             rule_id = await _save_draft_rule(d)
             reset_flow(admin_id)
@@ -5455,17 +5667,28 @@ async def on_callback(client: Client, cq: CallbackQuery):
 
         elif data == "auto:draft_match":
             await ack()
+            f = flow(admin_id)
+            d = _draft(f)
+            current = d.get("match_type", "exact")
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton(label, callback_data=f"auto:draft_setmatch:{mt}")]
-                for mt, label in MATCH_LABELS.items()
-            ] + [[InlineKeyboardButton("« Back", callback_data="auto:adv_draft")]])
+                [InlineKeyboardButton(("✅ " if current == "exact" else "") + "🎯 Exact Match",
+                                      callback_data="auto:draft_setmatch:exact")],
+                [InlineKeyboardButton(("✅ " if current == "contains" else "") + "🔎 Contains / Keyword",
+                                      callback_data="auto:draft_setmatch:contains")],
+                [InlineKeyboardButton(("✅ " if current == "any" else "") + "🌀 Any Message",
+                                      callback_data="auto:draft_setmatch:any")],
+                [InlineKeyboardButton("« Back", callback_data="auto:adv_draft")],
+            ])
             await safe_edit(cq.message, "Choose match mode:", kb)
 
         elif data.startswith("auto:draft_setmatch:"):
             await ack()
+            mt = p[2]
+            if mt not in ALLOWED_MATCH_TYPES:
+                await ack("Unknown mode.", True)
+                return
             f = flow(admin_id)
             d = _draft(f)
-            mt = p[2]
             d["match_type"] = mt
             if mt == "any":
                 d["trigger_value"] = ""
